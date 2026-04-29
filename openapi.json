@@ -1,0 +1,1040 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "FoodLoop Auth Service",
+    "version": "1.0.0",
+    "description": "Standalone authentication & authorization microservice for FoodLoop.\n\nSupports:\n- Email/password registration and login (JWT)\n- OAuth2 via Google, Apple, Facebook (Authorization Code Flow)\n- Access + Refresh token pair with rotation strategy\n- Token introspection for internal services\n- Account management (password reset, email verification, logout)\n\n**Token Strategy:**\n- Access token: short-lived JWT (15 min), signed HS256 or RS256\n- Refresh token: long-lived opaque token (30 days), stored in DB, rotated on every use\n- On refresh: old refresh token is invalidated, new pair is issued\n- Refresh token reuse detection: if an already-used token is presented, the entire family is revoked (reuse attack protection)\n\n**JWT Access Token Payload:**\n```json\n{\n  \"sub\": \"<user_id>\",\n  \"username\": \"john_doe\",\n  \"role\": \"user\",\n  \"permissions\": [\"read:profile\", \"write:food\"],\n  \"iat\": 1700000000,\n  \"exp\": 1700000900,\n  \"jti\": \"<unique_token_id>\"\n}\n```\n",
+    "contact": {
+      "name": "FoodLoop Dev Team"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://auth.foodloop.app/v1",
+      "description": "Production"
+    },
+    {
+      "url": "https://auth.staging.foodloop.app/v1",
+      "description": "Staging"
+    },
+    {
+      "url": "http://localhost:4000/v1",
+      "description": "Local development"
+    }
+  ],
+  "tags": [
+    { "name": "Auth",     "description": "Registration, login, logout" },
+    { "name": "Tokens",   "description": "Token refresh, revocation, introspection" },
+    { "name": "OAuth2",   "description": "Social login — Google, Apple, Facebook" },
+    { "name": "Password", "description": "Password reset flow" },
+    { "name": "Email",    "description": "Email verification" },
+    { "name": "Account",  "description": "Current user profile & account settings" }
+  ],
+  "paths": {
+
+    "/auth/register": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Register a new user",
+        "description": "Creates a new account with email and password.\n\nAfter successful registration:\n1. A verification email is sent to the provided address.\n2. The account is created in `unverified` status.\n3. A token pair is returned immediately so the user can use the app while waiting for email verification.\n\n**Rate limit:** 5 requests / 15 min per IP.",
+        "operationId": "registerUser",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RegisterRequest" },
+              "example": {
+                "email": "john@example.com",
+                "password": "MyStr0ng!Pass",
+                "username": "john_doe"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "User created. Token pair returned.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenPairResponse" }
+              }
+            }
+          },
+          "409": {
+            "description": "Email or username already taken.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "422": {
+            "description": "Validation error (weak password, invalid email format, etc.)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ValidationErrorResponse" } } }
+          },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+
+    "/auth/login": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Login with email and password",
+        "description": "Authenticates a user and returns a JWT access token + refresh token.\n\nIf the account uses OAuth2 only (no password set), returns `403` with `code: oauth_only`.\n\n**Rate limit:** 10 requests / 15 min per IP.",
+        "operationId": "loginUser",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/LoginRequest" },
+              "example": {
+                "email": "john@example.com",
+                "password": "MyStr0ng!Pass"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Login successful.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenPairResponse" }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "403": {
+            "description": "Account is OAuth-only, banned, or unverified (if email verification is enforced).",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+
+    "/auth/logout": {
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Logout (revoke refresh token)",
+        "description": "Revokes the provided refresh token so it can no longer be used.\nThe access token remains valid until it naturally expires (15 min).\n\nTo fully invalidate all sessions for a user, use `DELETE /account/sessions`.\n\n**Auth required:** Bearer access token.",
+        "operationId": "logoutUser",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/LogoutRequest" },
+              "example": { "refresh_token": "dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4..." }
+            }
+          }
+        },
+        "responses": {
+          "204": { "description": "Refresh token revoked. No content." },
+          "400": {
+            "description": "Refresh token missing or malformed.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+
+    "/tokens/refresh": {
+      "post": {
+        "tags": ["Tokens"],
+        "summary": "Refresh access token",
+        "description": "Issues a new access token + refresh token pair using a valid refresh token.\n\n**Rotation strategy:** The presented refresh token is immediately invalidated. A brand-new refresh token is returned.\n\n**Reuse attack detection:** If a previously used (already-rotated) refresh token is presented, the entire token family is revoked and the user must log in again. A `SecurityAlert` event is emitted.\n\n**Rate limit:** 30 requests / 15 min per refresh token family.",
+        "operationId": "refreshTokens",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RefreshRequest" },
+              "example": { "refresh_token": "dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4..." }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "New token pair issued.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenPairResponse" }
+              }
+            }
+          },
+          "401": {
+            "description": "Refresh token invalid, expired, or already used (reuse attack detected — family revoked).",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+
+    "/tokens/revoke": {
+      "post": {
+        "tags": ["Tokens"],
+        "summary": "Revoke a specific refresh token",
+        "description": "Explicitly revokes a single refresh token. Useful for 'log out from this device' functionality.\n\n**Auth required:** Bearer access token.",
+        "operationId": "revokeToken",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RefreshRequest" }
+            }
+          }
+        },
+        "responses": {
+          "204": { "description": "Token revoked." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": {
+            "description": "Token not found or does not belong to authenticated user.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+
+    "/tokens/introspect": {
+      "post": {
+        "tags": ["Tokens"],
+        "summary": "Introspect an access token (internal)",
+        "description": "Validates an access token and returns its decoded payload.\n\nIntended for **internal microservices** that need to verify tokens without holding the signing secret. Protected by a service-to-service API key (`X-Service-Key` header).\n\nReturns `active: false` for expired, revoked, or malformed tokens (never 401 — allows caller to handle gracefully).",
+        "operationId": "introspectToken",
+        "security": [{ "serviceApiKey": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["token"],
+                "properties": {
+                  "token": { "type": "string", "description": "The JWT access token to introspect." }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Introspection result (always 200, check `active` field).",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/IntrospectionResponse" }
+              }
+            }
+          },
+          "403": {
+            "description": "Invalid or missing service API key.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+
+    "/oauth/{provider}/authorize": {
+      "get": {
+        "tags": ["OAuth2"],
+        "summary": "Initiate OAuth2 Authorization Code flow",
+        "description": "Redirects the user to the OAuth2 provider's authorization page.\n\nSupported providers: `google`, `apple`, `facebook`.\n\nThe service generates a `state` parameter (CSRF protection) and a `code_verifier`/`code_challenge` pair (PKCE) before redirecting.\n\n**Flow:**\n1. Client calls this endpoint.\n2. User is redirected to provider (Google/Apple/Facebook).\n3. Provider redirects back to `/oauth/{provider}/callback` with `code` and `state`.\n4. Auth service exchanges code for provider tokens, fetches user profile.\n5. Creates or links account, returns token pair to client.",
+        "operationId": "oauthAuthorize",
+        "parameters": [
+          { "$ref": "#/components/parameters/OAuthProvider" },
+          {
+            "name": "redirect_uri",
+            "in": "query",
+            "required": false,
+            "description": "Override the default post-auth redirect URI (must be whitelisted in config).",
+            "schema": { "type": "string", "format": "uri" }
+          }
+        ],
+        "responses": {
+          "302": { "description": "Redirect to OAuth2 provider authorization URL." },
+          "400": {
+            "description": "Unknown provider.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+
+    "/oauth/{provider}/callback": {
+      "get": {
+        "tags": ["OAuth2"],
+        "summary": "OAuth2 callback — exchange code for tokens",
+        "description": "Handles the redirect from the OAuth2 provider.\n\nThis endpoint:\n1. Validates `state` (CSRF check).\n2. Exchanges `code` for provider access token (+ PKCE verification).\n3. Fetches user profile from provider.\n4. **If user exists** (matched by email): links the OAuth provider to the existing account.\n5. **If user is new**: creates a new account. Username is auto-generated from provider profile data; user can change it later.\n6. Returns a FoodLoop token pair to the client via redirect or JSON (depending on `redirect_uri`).\n\n**Apple-specific:** Apple only returns the user's name on the first authorization. The service must persist it on first callback.",
+        "operationId": "oauthCallback",
+        "parameters": [
+          { "$ref": "#/components/parameters/OAuthProvider" },
+          {
+            "name": "code",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Authorization code from provider."
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "CSRF state token."
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Error code if user denied access."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OAuth login successful. Token pair returned.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenPairResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid state (CSRF), missing code, or user denied access.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "502": {
+            "description": "Provider API error (e.g., Google is down).",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+
+    "/password/forgot": {
+      "post": {
+        "tags": ["Password"],
+        "summary": "Request password reset email",
+        "description": "Sends a password reset link to the provided email address.\n\nAlways returns `200` regardless of whether the email exists — this prevents user enumeration attacks.\n\nThe reset token expires in **1 hour** and is single-use.\n\n**Rate limit:** 3 requests / 60 min per email.",
+        "operationId": "forgotPassword",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email"],
+                "properties": {
+                  "email": { "type": "string", "format": "email" }
+                }
+              },
+              "example": { "email": "john@example.com" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "If the email exists, a reset link was sent." },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+
+    "/password/reset": {
+      "post": {
+        "tags": ["Password"],
+        "summary": "Reset password with token",
+        "description": "Resets the user's password using the token from the reset email.\n\nAfter successful reset:\n- All existing refresh tokens for the user are revoked (forced logout from all devices).\n- A new token pair is returned so the user is automatically logged in.\n\n**Rate limit:** 5 requests / 15 min per token.",
+        "operationId": "resetPassword",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ResetPasswordRequest" },
+              "example": {
+                "token": "a1b2c3d4e5...",
+                "new_password": "NewStr0ng!Pass"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Password reset successful. New token pair returned.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenPairResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "Token invalid, expired, or already used.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "422": {
+            "description": "New password fails validation (too weak, same as old, etc.)",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ValidationErrorResponse" } } }
+          }
+        }
+      }
+    },
+
+    "/password/change": {
+      "post": {
+        "tags": ["Password"],
+        "summary": "Change password (authenticated)",
+        "description": "Changes the password for the currently authenticated user.\n\nRequires the current password to be provided.\nOn success, all other refresh tokens (except the current session) are revoked.\n\n**Auth required:** Bearer access token.",
+        "operationId": "changePassword",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ChangePasswordRequest" }
+            }
+          }
+        },
+        "responses": {
+          "204": { "description": "Password changed successfully." },
+          "400": {
+            "description": "Current password is incorrect.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": {
+            "description": "New password fails validation.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ValidationErrorResponse" } } }
+          }
+        }
+      }
+    },
+
+    "/email/verify": {
+      "post": {
+        "tags": ["Email"],
+        "summary": "Verify email address",
+        "description": "Verifies the user's email using the token sent during registration.\n\nThe token expires in **24 hours** and is single-use.\n\nOn success, account status is updated to `active`.",
+        "operationId": "verifyEmail",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["token"],
+                "properties": {
+                  "token": { "type": "string", "description": "Email verification token from the email link." }
+                }
+              },
+              "example": { "token": "f9e8d7c6b5..." }
+            }
+          }
+        },
+        "responses": {
+          "204": { "description": "Email verified. Account is now active." },
+          "400": {
+            "description": "Token invalid, expired, or already used.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    },
+
+    "/email/resend-verification": {
+      "post": {
+        "tags": ["Email"],
+        "summary": "Resend verification email",
+        "description": "Resends the email verification link.\n\nCan be called with just an email address (for unauthenticated users who lost the email) or with a Bearer token.\n\nReturns `200` always (prevents email enumeration).\n\n**Rate limit:** 2 requests / 30 min per email.",
+        "operationId": "resendVerification",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["email"],
+                "properties": {
+                  "email": { "type": "string", "format": "email" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "If the email exists and is unverified, a new link was sent." },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+
+    "/account/me": {
+      "get": {
+        "tags": ["Account"],
+        "summary": "Get current user profile",
+        "description": "Returns the profile of the authenticated user.\n\n**Auth required:** Bearer access token.",
+        "operationId": "getMe",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "User profile.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UserProfile" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "patch": {
+        "tags": ["Account"],
+        "summary": "Update current user profile",
+        "description": "Updates editable fields on the user's profile (username, etc.).\n\nIf `email` is changed, a new verification email is sent and `email_verified` is reset to `false`.\n\n**Auth required:** Bearer access token.",
+        "operationId": "updateMe",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UpdateProfileRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated profile.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UserProfile" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": {
+            "description": "Username or email already taken.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "422": {
+            "description": "Validation error.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ValidationErrorResponse" } } }
+          }
+        }
+      }
+    },
+
+    "/account/sessions": {
+      "get": {
+        "tags": ["Account"],
+        "summary": "List active sessions",
+        "description": "Returns all active refresh token sessions for the authenticated user.\n\nUseful for a 'where I'm logged in' UI. Each session includes metadata like IP address, user agent, and last used timestamp.\n\n**Auth required:** Bearer access token.",
+        "operationId": "listSessions",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "List of active sessions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "sessions": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/Session" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "delete": {
+        "tags": ["Account"],
+        "summary": "Revoke all sessions (logout everywhere)",
+        "description": "Revokes all refresh tokens for the authenticated user — effectively logs out from all devices.\n\n**Auth required:** Bearer access token.",
+        "operationId": "revokeAllSessions",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "204": { "description": "All sessions revoked." },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+
+    "/account/connected-providers": {
+      "get": {
+        "tags": ["Account"],
+        "summary": "List connected OAuth providers",
+        "description": "Returns which OAuth2 providers (Google, Apple, Facebook) are linked to the authenticated user's account.\n\n**Auth required:** Bearer access token.",
+        "operationId": "listConnectedProviders",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Connected providers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "providers": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/ConnectedProvider" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+
+    "/account/connected-providers/{provider}": {
+      "delete": {
+        "tags": ["Account"],
+        "summary": "Disconnect an OAuth provider",
+        "description": "Unlinks a social login provider from the user's account.\n\nReturns `400` if this is the only login method and the account has no password set (would lock the user out).\n\n**Auth required:** Bearer access token.",
+        "operationId": "disconnectProvider",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "$ref": "#/components/parameters/OAuthProvider" }
+        ],
+        "responses": {
+          "204": { "description": "Provider disconnected." },
+          "400": {
+            "description": "Cannot disconnect — only login method remaining.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": {
+            "description": "Provider not connected to this account.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorResponse" } } }
+          }
+        }
+      }
+    }
+
+  },
+
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Short-lived JWT access token. Lifetime: 15 minutes. Obtain from `/auth/login`, `/auth/register`, or `/tokens/refresh`."
+      },
+      "serviceApiKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Service-Key",
+        "description": "Static API key for internal service-to-service calls (e.g., token introspection). Never exposed to clients."
+      }
+    },
+
+    "parameters": {
+      "OAuthProvider": {
+        "name": "provider",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "enum": ["google", "apple", "facebook"]
+        },
+        "description": "OAuth2 provider name."
+      }
+    },
+
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing or invalid access token.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+            "example": {
+              "error": { "code": "unauthorized", "message": "Access token is missing or invalid." }
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "Too many requests.",
+        "headers": {
+          "Retry-After": {
+            "schema": { "type": "integer" },
+            "description": "Seconds until the rate limit resets."
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+            "example": {
+              "error": { "code": "rate_limited", "message": "Too many requests. Please try again later." }
+            }
+          }
+        }
+      }
+    },
+
+    "schemas": {
+
+      "RegisterRequest": {
+        "type": "object",
+        "required": ["email", "password", "username"],
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email",
+            "description": "User's email address. Must be unique.",
+            "example": "john@example.com"
+          },
+          "password": {
+            "type": "string",
+            "minLength": 8,
+            "description": "Password. Min 8 chars, must contain uppercase, lowercase, digit, and special character.",
+            "example": "MyStr0ng!Pass"
+          },
+          "username": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 30,
+            "pattern": "^[a-zA-Z0-9_]+$",
+            "description": "Unique username. Alphanumeric and underscores only.",
+            "example": "john_doe"
+          }
+        }
+      },
+
+      "LoginRequest": {
+        "type": "object",
+        "required": ["email", "password"],
+        "properties": {
+          "email": { "type": "string", "format": "email" },
+          "password": { "type": "string" }
+        }
+      },
+
+      "LogoutRequest": {
+        "type": "object",
+        "required": ["refresh_token"],
+        "properties": {
+          "refresh_token": {
+            "type": "string",
+            "description": "The refresh token to revoke."
+          }
+        }
+      },
+
+      "RefreshRequest": {
+        "type": "object",
+        "required": ["refresh_token"],
+        "properties": {
+          "refresh_token": {
+            "type": "string",
+            "description": "A valid, non-expired, non-rotated refresh token."
+          }
+        }
+      },
+
+      "ResetPasswordRequest": {
+        "type": "object",
+        "required": ["token", "new_password"],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "Password reset token received via email."
+          },
+          "new_password": {
+            "type": "string",
+            "minLength": 8,
+            "description": "New password. Same strength requirements as registration."
+          }
+        }
+      },
+
+      "ChangePasswordRequest": {
+        "type": "object",
+        "required": ["current_password", "new_password"],
+        "properties": {
+          "current_password": { "type": "string" },
+          "new_password": { "type": "string", "minLength": 8 }
+        }
+      },
+
+      "UpdateProfileRequest": {
+        "type": "object",
+        "properties": {
+          "username": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 30,
+            "pattern": "^[a-zA-Z0-9_]+$"
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "description": "Changing email triggers a new verification flow."
+          }
+        }
+      },
+
+      "TokenPairResponse": {
+        "type": "object",
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "description": "Signed JWT. Expires in 15 minutes. Include as `Authorization: Bearer <token>` in requests."
+          },
+          "refresh_token": {
+            "type": "string",
+            "description": "Opaque refresh token. Expires in 30 days. Store securely (httpOnly cookie recommended). Single-use — rotated on every `/tokens/refresh` call."
+          },
+          "token_type": {
+            "type": "string",
+            "enum": ["Bearer"],
+            "example": "Bearer"
+          },
+          "expires_in": {
+            "type": "integer",
+            "description": "Access token lifetime in seconds.",
+            "example": 900
+          },
+          "user": { "$ref": "#/components/schemas/UserProfile" }
+        }
+      },
+
+      "IntrospectionResponse": {
+        "type": "object",
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "`true` if the token is valid, not expired, and not revoked."
+          },
+          "sub": {
+            "type": "string",
+            "description": "User ID. Present only when `active: true`.",
+            "example": "usr_01hx..."
+          },
+          "username": {
+            "type": "string",
+            "example": "john_doe"
+          },
+          "role": {
+            "type": "string",
+            "enum": ["user", "moderator", "admin"],
+            "example": "user"
+          },
+          "permissions": {
+            "type": "array",
+            "items": { "type": "string" },
+            "example": ["read:profile", "write:food"]
+          },
+          "exp": {
+            "type": "integer",
+            "description": "Token expiry as Unix timestamp.",
+            "example": 1700000900
+          },
+          "jti": {
+            "type": "string",
+            "description": "Unique JWT ID.",
+            "example": "tok_01hy..."
+          }
+        }
+      },
+
+      "UserProfile": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique user ID (ULID/UUID).",
+            "example": "usr_01hx4k2m..."
+          },
+          "username": {
+            "type": "string",
+            "example": "john_doe"
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "example": "john@example.com"
+          },
+          "email_verified": {
+            "type": "boolean",
+            "example": true
+          },
+          "role": {
+            "type": "string",
+            "enum": ["user", "moderator", "admin"],
+            "example": "user"
+          },
+          "permissions": {
+            "type": "array",
+            "items": { "type": "string" },
+            "example": ["read:profile", "write:food"]
+          },
+          "status": {
+            "type": "string",
+            "enum": ["unverified", "active", "banned"],
+            "description": "`unverified` = email not confirmed yet. `banned` = account suspended.",
+            "example": "active"
+          },
+          "avatar_url": {
+            "type": "string",
+            "format": "uri",
+            "nullable": true,
+            "description": "URL to user avatar. May come from OAuth provider.",
+            "example": "https://lh3.googleusercontent.com/..."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2025-01-15T10:30:00Z"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "example": "2025-10-28T02:11:00Z"
+          }
+        }
+      },
+
+      "Session": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Session identifier (refresh token family ID).",
+            "example": "ses_01hz..."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the session was first created (login time)."
+          },
+          "last_used_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the refresh token was last rotated."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the refresh token expires (30 days from creation)."
+          },
+          "ip_address": {
+            "type": "string",
+            "example": "192.168.1.1",
+            "description": "IP address from login request."
+          },
+          "user_agent": {
+            "type": "string",
+            "example": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0...)",
+            "description": "User agent string from login request."
+          },
+          "provider": {
+            "type": "string",
+            "nullable": true,
+            "enum": ["email", "google", "apple", "facebook"],
+            "description": "Login method used to create this session.",
+            "example": "google"
+          },
+          "is_current": {
+            "type": "boolean",
+            "description": "`true` if this session corresponds to the token used to make this request."
+          }
+        }
+      },
+
+      "ConnectedProvider": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": ["google", "apple", "facebook"],
+            "example": "google"
+          },
+          "provider_user_id": {
+            "type": "string",
+            "description": "User's ID on the provider's platform.",
+            "example": "115...319"
+          },
+          "connected_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "nullable": true,
+            "description": "Email returned by the provider (may differ from account email)."
+          }
+        }
+      },
+
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "description": "Machine-readable error code.",
+                "example": "unauthorized",
+                "enum": [
+                  "unauthorized",
+                  "forbidden",
+                  "not_found",
+                  "conflict",
+                  "validation_error",
+                  "rate_limited",
+                  "oauth_only",
+                  "token_expired",
+                  "token_reused",
+                  "token_revoked",
+                  "provider_error",
+                  "internal_error"
+                ]
+              },
+              "message": {
+                "type": "string",
+                "description": "Human-readable error description.",
+                "example": "Access token is missing or invalid."
+              }
+            }
+          }
+        }
+      },
+
+      "ValidationErrorResponse": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "string", "example": "validation_error" },
+              "message": { "type": "string", "example": "Request validation failed." },
+              "fields": {
+                "type": "array",
+                "description": "Per-field validation errors.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "field": { "type": "string", "example": "password" },
+                    "message": { "type": "string", "example": "Password must contain at least one special character." }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+    }
+  }
+}
