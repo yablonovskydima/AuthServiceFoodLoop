@@ -1,0 +1,298 @@
+{
+  "asyncapi": "3.0.0",
+  "info": {
+    "title": "FoodLoop Auth Service — Events",
+    "version": "1.0.0",
+    "description": "Events published by the Auth Service to Kafka."
+  },
+  "defaultContentType": "application/json",
+  "servers": {
+    "local": {
+      "host": "localhost:9092",
+      "protocol": "kafka",
+      "description": "Local development"
+    }
+  },
+  "channels": {
+    "userRegistered": {
+      "address": "foodloop.auth.user.registered",
+      "description": "Published when a new user account is created (email/password or OAuth2).",
+      "messages": {
+        "UserRegisteredMessage": {
+          "$ref": "#/components/messages/UserRegisteredMessage"
+        }
+      }
+    },
+    "userLoggedIn": {
+      "address": "foodloop.auth.user.logged_in",
+      "description": "Published on every successful login.",
+      "messages": {
+        "UserLoggedInMessage": {
+          "$ref": "#/components/messages/UserLoggedInMessage"
+        }
+      }
+    },
+    "userLoggedOut": {
+      "address": "foodloop.auth.user.logged_out",
+      "description": "Published when a user logs out.",
+      "messages": {
+        "UserLoggedOutMessage": {
+          "$ref": "#/components/messages/UserLoggedOutMessage"
+        }
+      }
+    },
+    "allSessionsRevoked": {
+      "address": "foodloop.auth.session.all_revoked",
+      "description": "Published when all sessions for a user are revoked (password reset, logout everywhere).",
+      "messages": {
+        "AllSessionsRevokedMessage": {
+          "$ref": "#/components/messages/AllSessionsRevokedMessage"
+        }
+      }
+    },
+    "tokenReuseDetected": {
+      "address": "foodloop.auth.security.token_reuse_detected",
+      "description": "Published when a rotated refresh token is used again — possible token theft. The entire token family is already revoked at this point.",
+      "messages": {
+        "TokenReuseDetectedMessage": {
+          "$ref": "#/components/messages/TokenReuseDetectedMessage"
+        }
+      }
+    }
+  },
+  "operations": {
+    "publishUserRegistered": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/userRegistered"
+      },
+      "messages": [
+        {
+          "$ref": "#/channels/userRegistered/messages/UserRegisteredMessage"
+        }
+      ]
+    },
+    "publishUserLoggedIn": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/userLoggedIn"
+      },
+      "messages": [
+        {
+          "$ref": "#/channels/userLoggedIn/messages/UserLoggedInMessage"
+        }
+      ]
+    },
+    "publishUserLoggedOut": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/userLoggedOut"
+      },
+      "messages": [
+        {
+          "$ref": "#/channels/userLoggedOut/messages/UserLoggedOutMessage"
+        }
+      ]
+    },
+    "publishAllSessionsRevoked": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/allSessionsRevoked"
+      },
+      "messages": [
+        {
+          "$ref": "#/channels/allSessionsRevoked/messages/AllSessionsRevokedMessage"
+        }
+      ]
+    },
+    "publishTokenReuseDetected": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/tokenReuseDetected"
+      },
+      "messages": [
+        {
+          "$ref": "#/channels/tokenReuseDetected/messages/TokenReuseDetectedMessage"
+        }
+      ]
+    }
+  },
+  "components": {
+    "messages": {
+      "UserRegisteredMessage": {
+        "name": "UserRegistered",
+        "payload": {
+          "type": "object",
+          "required": [
+            "user_id",
+            "username",
+            "email",
+            "registration_method"
+          ],
+          "properties": {
+            "user_id": {
+              "type": "string",
+              "example": "usr_01hx4k2m"
+            },
+            "username": {
+              "type": "string",
+              "example": "john_doe"
+            },
+            "email": {
+              "type": "string",
+              "format": "email"
+            },
+            "registration_method": {
+              "type": "string",
+              "enum": [
+                "email",
+                "oauth"
+              ]
+            },
+            "oauth_provider": {
+              "type": "string",
+              "enum": [
+                "google",
+                "apple",
+                "facebook"
+              ],
+              "nullable": true
+            },
+            "email_verified": {
+              "type": "boolean"
+            }
+          }
+        },
+        "examples": [
+          {
+            "payload": {
+              "user_id": "usr_01hx4k2m",
+              "username": "john_doe",
+              "email": "john@example.com",
+              "registration_method": "email",
+              "oauth_provider": null,
+              "email_verified": false
+            }
+          }
+        ]
+      },
+      "UserLoggedInMessage": {
+        "name": "UserLoggedIn",
+        "payload": {
+          "type": "object",
+          "required": [
+            "user_id",
+            "login_method",
+            "session_id"
+          ],
+          "properties": {
+            "user_id": {
+              "type": "string",
+              "example": "usr_01hx4k2m"
+            },
+            "login_method": {
+              "type": "string",
+              "enum": [
+                "email",
+                "oauth"
+              ]
+            },
+            "oauth_provider": {
+              "type": "string",
+              "enum": [
+                "google",
+                "apple",
+                "facebook"
+              ],
+              "nullable": true
+            },
+            "session_id": {
+              "type": "string",
+              "example": "ses_01hz6m"
+            },
+            "ip_address": {
+              "type": "string",
+              "example": "192.168.1.1"
+            }
+          }
+        },
+        "examples": [
+          {
+            "payload": {
+              "user_id": "usr_01hx4k2m",
+              "login_method": "oauth",
+              "oauth_provider": "google",
+              "session_id": "ses_01hz6m",
+              "ip_address": "192.168.1.1"
+            }
+          }
+        ]
+      },
+      "UserLoggedOutMessage": {
+        "name": "UserLoggedOut",
+        "payload": {
+          "type": "object",
+          "required": [
+            "user_id",
+            "session_id"
+          ],
+          "properties": {
+            "user_id": {
+              "type": "string",
+              "example": "usr_01hx4k2m"
+            },
+            "session_id": {
+              "type": "string",
+              "example": "ses_01hz6m"
+            }
+          }
+        }
+      },
+      "AllSessionsRevokedMessage": {
+        "name": "AllSessionsRevoked",
+        "payload": {
+          "type": "object",
+          "required": [
+            "user_id",
+            "reason"
+          ],
+          "properties": {
+            "user_id": {
+              "type": "string",
+              "example": "usr_01hx4k2m"
+            },
+            "reason": {
+              "type": "string",
+              "enum": [
+                "logout_all",
+                "password_reset",
+                "security_event"
+              ]
+            }
+          }
+        }
+      },
+      "TokenReuseDetectedMessage": {
+        "name": "TokenReuseDetected",
+        "payload": {
+          "type": "object",
+          "required": [
+            "user_id",
+            "ip_address"
+          ],
+          "properties": {
+            "user_id": {
+              "type": "string",
+              "example": "usr_01hx4k2m"
+            },
+            "ip_address": {
+              "type": "string",
+              "nullable": true,
+              "example": "192.168.1.1"
+            }
+          }
+        }
+      }
+    }
+  }
+}
