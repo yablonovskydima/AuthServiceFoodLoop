@@ -1,0 +1,104 @@
+version: "3.9"
+
+services:
+  auth:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: auth_service
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+      DB_HOST: postgres
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      SMTP_HOST: mailhog
+      SMTP_PORT: 1025
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - auth_net
+    volumes:
+      - ./src:/app/src:ro
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: auth_postgres
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: ${DB_NAME:-authdb}
+      POSTGRES_USER: ${DB_USER:-authuser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-authpass}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-authuser} -d ${DB_NAME:-authdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - auth_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: auth_redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redispass} --save 60 1
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redispass}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - auth_net
+
+  # Local SMTP server — catches all outbound emails (email verification, password reset)
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: auth_mailhog
+    restart: unless-stopped
+    ports:
+      - "8025:8025"   # Web UI
+      - "1025:1025"   # SMTP
+    networks:
+      - auth_net
+
+  # Postgres admin UI
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: auth_pgadmin
+    restart: unless-stopped
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@local.dev}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-adminpass}
+    depends_on:
+      - postgres
+    networks:
+      - auth_net
+    profiles:
+      - tools   # start only with: docker compose --profile tools up
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  auth_net:
+    driver: bridge
